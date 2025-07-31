@@ -12,10 +12,20 @@
 #include <unistd.h>
 #include <sys/wait.h>
 
+// #include <direct.h> // _getcwd
+// #include <sys/stat.h>   // stat
+// #include "instrument_flag.h"
+// #include "frameobject.h"
+// #include "opcode.h"
+
+
 static pid_t pid;
 static int flag_config_loaded = 0;
 static int core_main_file_flag = 0;
 static int current_lineno = 0;
+static int flag_main_file = 0;
+static int core_exec_flag = 0;
+static int flag_control_mode = 0;
 
 static char name_main_file[1024];
 static char main_folder[1024];
@@ -25,16 +35,30 @@ static char python_folder[1024];
 static char pip_folder[1024];
 static char fork_record_folder[1024];
 static int flag_pyinstaller = 0;
-static int loop_limit = 50; // 默认值
+static int loop_limit = 50;
 static int flag_call_uninvoked_function = 0;
 static int flag_func_memory = 0;
 static char memory_folder[1024];
-static int flag_cut_branch = 1; // 默认值
+static int flag_cut_branch = 1; 
 static char object_dump_folder[1024];
 
 static int last_line_main = 0;
 static int executed_lines[30000] = {0}; // 假设最大行号不超过30000
 static int max_lineno = 0;
+
+
+char last_file_name_main[1024];
+int flag_call_function_from_main = 0;
+int flag_call_function_from_main_error = 0;
+char current_func[512]="";
+int flag_iter = 0;
+int flag_in_loop = 0;
+int jump_count[4096] = { 0 } ;
+int flag_last_record_used = 0;
+int fork_record_length = 0;
+char merge_frame_name[512] ="";
+char current_import_module[256] = "";
+char tmp_fake_object[512] = "";
 
 struct fork_record
 {
@@ -47,7 +71,15 @@ struct fork_record
 };
 static struct fork_record G_FORK_RECORDS[1000];
 static int G_FORK_RECORD_COUNT = 0;
+struct force_func{
+    char func_name[256];
+    int index;
+};
+struct force_func func_list[1000];
 
+int log_flag = 0;
+int cond_instru = 0;
+PyObject *FakeObject_dict = NULL;
 
 
 static inline int is_target(const char *filename) {
@@ -166,7 +198,6 @@ static int load_configuration_file(const char *path) {
     fclose(config_file);
     return 1;
 }
-// 辅助函数：将一个C字符串路径添加到sys.path列表的末尾
 static void append_to_sys_path(const char* path) {
     PyObject *sys_path = PySys_GetObject("path");
     if (sys_path == NULL || !PyList_Check(sys_path)) {
@@ -232,15 +263,20 @@ static void add_pyinstaller(void) {
     // 将当前目录也加入，以防万一
     append_to_sys_path(cwd);
 }
-// 这个函数只在第一次进入目标主文件时被调用一次
+// 只在第一次进入目标主文件时被调用一次
 static void initialize_main_analysis_env(void) {
-    // 在这里调用路径修改函数，此时sys.path肯定已经准备好了
     if (flag_pyinstaller) {
         add_pyinstaller();
     } else {
         add_pip();
     }
-
+    //TO DO
+    // if (!flag_main_file) {
+    //     if(FakeObject_dict == NULL){
+    //         FakeObject_dict = PyDict_New();
+    //         printf("[%5u debug log] FakeObject_dict has been created\n",pid);
+    //     }
+    // }
 }
 static void load_configuration(void) {
     pid = getpid(); // 使用Linux的getpid()
@@ -266,15 +302,13 @@ static void load_configuration(void) {
 }
 
 
-// --- Function to read the fork record file passed from a parent process ---
+
 static void read_config_from_parent(const char* path) {
     FILE* fp = fopen(path, "r");
     if (fp == NULL) {
-        // This is not an error, it just means there's no config to read
         return;
     }
 
-    // Clear any existing records before loading
     G_FORK_RECORD_COUNT = 0;
 
     char *line = NULL;
@@ -282,7 +316,7 @@ static void read_config_from_parent(const char* path) {
     ssize_t read;
 
     while ((read = getline(&line, &len, fp)) != -1) {
-        if (G_FORK_RECORD_COUNT >= 999) break; // Prevent overflow
+        if (G_FORK_RECORD_COUNT >= 999) break;
 
         struct fork_record* rec = &G_FORK_RECORDS[G_FORK_RECORD_COUNT];
         int items = sscanf(line, "%s %d %d %d %d",
@@ -297,20 +331,15 @@ static void read_config_from_parent(const char* path) {
     free(line);
     fclose(fp);
 }
-// If the record does not exist, add it and return -1 (means we need to fork).
-// Else, return the condition for the corresponding record.
 static inline int check_or_write_record(const char *filename, int offset, int opcode, int oparg, int cond) {
     for (int i = 0; i < G_FORK_RECORD_COUNT; ++i) {
         if (G_FORK_RECORDS[i].offset == offset &&
             G_FORK_RECORDS[i].opcode == opcode &&
             strcmp(G_FORK_RECORDS[i].filename, filename) == 0)
         {
-            // Found it. We are replaying a path. Return the forced condition.
             return G_FORK_RECORDS[i].cond;
         }
     }
-    // No record found. This is a new decision point.
-    // Add it to our in-memory list.
     if (G_FORK_RECORD_COUNT < 999) {
         struct fork_record* rec = &G_FORK_RECORDS[G_FORK_RECORD_COUNT];
         strncpy(rec->filename, filename, sizeof(rec->filename) - 1);
@@ -319,24 +348,19 @@ static inline int check_or_write_record(const char *filename, int offset, int op
         rec->oparg = oparg;
         rec->cond = cond;
         G_FORK_RECORD_COUNT++;
-        return -1; // Signal that a fork is needed
+        return -1; 
     }
 
-    // Records are full, stop forking.
     return cond;
 }
-// This function encapsulates the logic for forking and executing a child process.
 static inline int fork_and_exec_child(int child_chosen_cond, int child_jump_target_oparg) {
-    // 1. Set the condition for the child's path in the last record
     if (G_FORK_RECORD_COUNT > 0) {
         G_FORK_RECORDS[G_FORK_RECORD_COUNT - 1].cond = child_chosen_cond;
     } else {
-        return -1; // Should not happen
+        return -1; 
     }
 
-    // 2. Prepare the configuration file for the child
     char child_config_path[1024];
-    // Use a unique filename in /tmp to avoid race conditions
     sprintf(child_config_path, "/tmp/pyforce_config_%d_%d", getpid(), G_FORK_RECORD_COUNT);
 
     FILE* fp = fopen(child_config_path, "w");
@@ -352,25 +376,22 @@ static inline int fork_and_exec_child(int child_chosen_cond, int child_jump_targ
     }
     fclose(fp);
 
-    // 3. Fork the process
     pid_t child_pid = fork();
 
     if (child_pid == -1) {
-        // Fork failed
         perror("fork failed");
-        remove(child_config_path); // Clean up config file
+        remove(child_config_path); 
         return -1;
     }
 
     if (child_pid == 0) {
-        // --- Child Process ---
         int    argc;
         char** argv;
         wchar_t** wargv;
 
         // 使用新的API获取 argc 和 argv
         Py_GetArgcArgv(&argc, &wargv);
-        // Py_GetArgcArgv 返回 wchar_t**，我们需要将其转换为 char**
+        // Py_GetArgcArgv 返回 wchar_t**，转换为 char**
         argv = (char**)PyMem_Malloc(sizeof(char*) * (argc + 1));
         if (argv == NULL) _exit(127);
         for(int i = 0; i < argc; i++) {
@@ -379,14 +400,12 @@ static inline int fork_and_exec_child(int child_chosen_cond, int child_jump_targ
         }
         argv[argc] = NULL;
 
-        // Create a new argv array for the child
         char** new_argv = malloc(sizeof(char*) * (argc + 3));
         if (new_argv == NULL) _exit(127);
 
         for (int i = 0; i < argc; i++) {
             new_argv[i] = argv[i];
         }
-        // Add our special arguments
         new_argv[argc] = "--pyforce-config";
         new_argv[argc + 1] = child_config_path;
         new_argv[argc + 2] = NULL;
@@ -396,11 +415,9 @@ static inline int fork_and_exec_child(int child_chosen_cond, int child_jump_targ
         char* executable_path = Py_EncodeLocale(w_executable_path, NULL);
         if (executable_path == NULL) _exit(127);
 
-        // Execute the new process
         execv(executable_path, new_argv);
 
         perror("execv failed");
-        // 清理内存
         free(new_argv);
         for(int i = 0; i < argc; i++) PyMem_RawFree(argv[i]);
         PyMem_Free(argv);
@@ -408,19 +425,13 @@ static inline int fork_and_exec_child(int child_chosen_cond, int child_jump_targ
         _exit(127);
     }
     else {
-        // --- Parent Process ---
         printf("[%d debug log] Forked a new process: %d\n", pid, child_pid);
-
-        // Wait for the child process to complete
         waitpid(child_pid, NULL, 0);
         printf("[%d debug log] Child process %d finished.\n", pid, child_pid);
-        
-        // After child is done, we don't need its config file anymore
         remove(child_config_path);
         return 1;
     }
 }
-// --- Function to read config from argv (to be called during initialization) ---
 static void read_fork_config_from_argv(void) {
     int    argc;
     wchar_t** wargv;
@@ -433,7 +444,6 @@ static void read_fork_config_from_argv(void) {
     for(int i = 0; i < argc; i++) {
         argv[i] = Py_EncodeLocale(wargv[i], NULL);
         if (argv[i] == NULL) {
-            // 清理已分配的内存
             for (int j = 0; j < i; j++) PyMem_RawFree(argv[j]);
             PyMem_Free(argv);
             return;
@@ -452,8 +462,47 @@ static void read_fork_config_from_argv(void) {
 
 }
 
-
-
+// TO DO
+// static inline void branch_cut(){
+//     if(last_line_main > mergeline && flag_last_record_used && strstr(current_frame,merge_frame_name)){
+//         char merge_filename[1024];
+//         sprintf(merge_filename,"%sMergeFile%d",fork_record_folder,mergeline);
+//         int file_exist = file_exists(merge_filename);
+//         if(flag_cut_branch == 1){
+//             printf("[%5lu debug log] we need to exit()\n",pid);
+//             FILE * pFile2 = fopen(outlog, "a");
+//             // if(pFile2 == NULL){
+//             //     printf("[%")
+//             // }
+//             fprintf(pFile2,"[%5lu] exit() in %d   mergeline is: %d\n",pid,last_line_main,mergeline);
+//             int lineno = 0;
+//             int search_lineno = 0;
+//             fprintf(pFile2,"[%5lu]: Coverage: ",pid);
+//             //char full_coverage[4096];
+//             while (lineno < 30000){
+//                 if(executed_lines[lineno]){
+//                     search_lineno = lineno + 1;
+//                     while (executed_lines[search_lineno] && search_lineno < 30000){
+//                         search_lineno = search_lineno + 1;
+//                     }
+//                     if(lineno == (search_lineno - 1)){
+//                         fprintf(pFile2,"%d, ",lineno);
+//                     }
+//                     else{
+//                         fprintf(pFile2,"%d - %d, ",lineno,search_lineno-1);
+//                     }
+//                     lineno = search_lineno;
+//                 }
+//                 else{
+//                     lineno = lineno + 1;
+//                 }
+//             }
+//             fprintf(pFile2,"\n");
+//             fclose(pFile2);
+//             exit(0);
+//         }
+//     }
+// }
 
 
 
@@ -464,12 +513,12 @@ static void read_fork_config_from_argv(void) {
 
 static inline void PyForce_Log(_PyInterpreterFrame *frame, int opcode) {
     static int main_env_initialized = 0;
-    // 1. 单次初始化
+    // 1. 配置懒加载
     if (!flag_config_loaded) {
         load_configuration();
     }
 
-    // 2. 上下文更新
+    // 2. 获取当前文件名与函数名
     const char *current_file_str = "<?>";
     PyObject *filename_obj = frame->f_code->co_filename;
     if (filename_obj != NULL && PyUnicode_Check(filename_obj)) {
@@ -478,10 +527,19 @@ static inline void PyForce_Log(_PyInterpreterFrame *frame, int opcode) {
             current_file_str = temp_str;
         }
     }
-    // 更新全局的 current_lineno
+    const char *current_frame_name = "<?>";
+    PyObject *frame_name_obj = frame->f_code->co_name;
+    if(frame_name_obj != NULL && PyUnicode_Check(frame_name_obj)) {
+        const char* temp_str = PyUnicode_AsUTF8(frame_name_obj);
+        if (temp_str != NULL) {
+            current_frame_name = temp_str;
+        }
+    }
+
+    // 3. 获取当前行号
     current_lineno = PyUnstable_InterpreterFrame_GetLine(frame);
 
-    // 3. 目标判断与日志记录
+    // 4. 判断是否目标文件
     if (is_target(current_file_str)) {
         core_main_file_flag = 1;
         last_line_main = current_lineno;
@@ -494,14 +552,6 @@ static inline void PyForce_Log(_PyInterpreterFrame *frame, int opcode) {
         // 打印执行日志
         const char *opname = _PyOpcode_OpName[opcode];
         if (opname == NULL) opname = "<UNKNOWN>";
-        const char *current_frame_name = "<?>";
-        PyObject *frame_name_obj = frame->f_code->co_name;
-        if(frame_name_obj != NULL && PyUnicode_Check(frame_name_obj)) {
-            const char* temp_str = PyUnicode_AsUTF8(frame_name_obj);
-            if (temp_str != NULL) {
-                current_frame_name = temp_str;
-            }
-        }
         const char* basename = strrchr(current_file_str, '/');
         if (basename != NULL) {
             basename++;
@@ -516,16 +566,13 @@ static inline void PyForce_Log(_PyInterpreterFrame *frame, int opcode) {
         core_main_file_flag = 0;
     }
 
-    // 4. 主分析环境单次初始化,只在第一次进入目标文件时执行一次
+    // 5. 单次初始化分析环境（main 文件识别）
     if (core_main_file_flag && !main_env_initialized) {
-       
         // a. 初始化sys.path
         initialize_main_analysis_env();
-        
         // b. 初始化forking环境
         // 如果是子进程，加载决策链;如果是主进程，read_fork_config_from_argv什么也不做，G_FORK_RECORDS为空。
         read_fork_config_from_argv(); 
-
         // c. 记录日志，标记主文件开始
         FILE * pFile2 = fopen(outlog, "a");
         if (pFile2) {
@@ -536,12 +583,17 @@ static inline void PyForce_Log(_PyInterpreterFrame *frame, int opcode) {
             }
             fclose(pFile2);
         }
-
         main_env_initialized = 1; // 确保只执行一次
     }
 
 
+
+    // if (flag_cut_branch &&  flag_config_loaded && core_main_file_flag && (mergeline != 0)) {
+    // 	branch_cut();
+    // }
 }
+
+
 
 #endif /* Py_INSTRUMENT_H */
 
