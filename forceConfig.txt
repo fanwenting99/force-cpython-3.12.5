@@ -1,0 +1,14 @@
+name_main_file: test.py
+main_folder: /home/fwt/cpython/force-cpython-3.12.5
+outlog: /home/fwt/cpython/force-cpython-3.12.5/test/pyforce_logs/analysis_log.txt
+forklog_path: /home/fwt/cpython/force-cpython-3.12.5/test/pyforce_logs/fork_log.txt
+python_folder: /usr
+pip_folder: /home/fwt/.local/lib/python3.12/site-packages
+fork_record_folder: /home/fwt/cpython/force-cpython-3.12.5/test/pyforce_fork_records/
+flag_pyinstaller: 0
+loop_limit: 10
+flag_call_uninvoked_function: 0
+flag_func_memory: 0
+memory_folder: /home/fwt/cpython/force-cpython-3.12.5/test/pyforce_memory_dumps/
+flag_cut_branch: 1
+object_dump_folder: /home/fwt/cpython/force-cpython-3.12.5/test/pyforce_object_dumps/

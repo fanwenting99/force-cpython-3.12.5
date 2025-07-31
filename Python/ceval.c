@@ -24,6 +24,10 @@
 #include "pycore_typeobject.h"    // _PySuper_Lookup()
 #include "pycore_emscripten_signal.h"  // _Py_CHECK_EMSCRIPTEN_SIGNALS
 
+//force begins
+#include "instrument.h"
+//force ends
+
 #include "pycore_dict.h"
 #include "dictobject.h"
 #include "pycore_frame.h"

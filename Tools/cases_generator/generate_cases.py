@@ -1090,12 +1090,70 @@ class Analyzer:
         self.out.emit("")
         if instr.inst.override:
             self.out.emit("// Override")
+            
+        #force begins
+        if name == "POP_JUMP_IF_FALSE":
+            # Manually add the necessary labels for our custom block
+            with self.out.block(f"TARGET({name})"):
+                self.out.emit(f"PyForce_Log(frame, opcode);")
+                self.out.emit("if (core_main_file_flag) {")
+                with self.out.indent():
+                    self.out.emit("PyObject *cond = POP();")
+                    self.out.emit("int offset = (int)(next_instr - _PyCode_CODE(frame->f_code) - 1);")
+                    self.out.emit("int target_lineno = PyCode_Addr2Line(frame->f_code, oparg);")
+                    self.out.emit("int tmp_cond_choice;")
+                    self.out.emit("PyObject *forced_cond = NULL;")
+                    self.out.emit("if (target_lineno < current_lineno) {")
+                    with self.out.indent():
+                        self.out.emit("forced_cond = Py_True;")
+                        self.out.emit("tmp_cond_choice = 1;")
+                    self.out.emit("} else if (target_lineno == current_lineno) {")
+                    with self.out.indent():
+                        self.out.emit("forced_cond = Py_True;")
+                        self.out.emit("tmp_cond_choice = 1;")
+                    self.out.emit("} else {")
+                    with self.out.indent():
+                        self.out.emit("forced_cond = Py_False;")
+                        self.out.emit("tmp_cond_choice = 0;")
+                    self.out.emit("}")
+                    self.out.emit("const char *filename_str = PyUnicode_AsUTF8(frame->f_code->co_filename);")
+                    self.out.emit("if (filename_str == NULL) { PyErr_Clear(); filename_str = \"<?>\"; }")
+                    self.out.emit("int record = check_or_write_record(filename_str, offset, opcode, oparg, tmp_cond_choice);")
+                    self.out.emit("if (record == -1) {")
+                    with self.out.indent():
+                        self.out.emit("fork_and_exec_child(1, oparg);")
+                    self.out.emit("} else {")
+                    with self.out.indent():
+                        self.out.emit("if (record == 1) forced_cond = Py_True;")
+                        self.out.emit("else forced_cond = Py_False;")
+                    self.out.emit("}")
+                    self.out.emit("if (PyObject_IsTrue(forced_cond) == 0) {")
+                    self.out.emit("    JUMPBY(oparg);")
+                    self.out.emit("}")
+                    self.out.emit("Py_DECREF(cond);")
+                    self.out.emit("DISPATCH();")
+                self.out.emit("} else {")
+                with self.out.indent():
+                    instr.write(self.out)
+                    if not instr.always_exits:
+                        self.out.emit("DISPATCH();")
+                self.out.emit("}")
+            return
+            #force ends
+
         with self.out.block(f"TARGET({name})"):
+            #force begins
+            self.out.emit(f"PyForce_Log(frame, opcode);")
+            #force ends
             if instr.predicted:
                 self.out.emit(f"PREDICTED({name});")
             instr.write(self.out)
             if not instr.always_exits:
                 for prediction in instr.predictions:
+                    #force begins
+                    if prediction == "POP_JUMP_IF_FALSE":
+                        continue
+                    #force ends
                     self.out.emit(f"PREDICT({prediction});")
                 if instr.check_eval_breaker:
                     self.out.emit("CHECK_EVAL_BREAKER();")
